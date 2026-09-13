@@ -10,6 +10,7 @@ import (
 
 	blockstore "github.com/ipfs/boxo/blockstore"
 	offline "github.com/ipfs/boxo/exchange/offline"
+	merkledag "github.com/ipfs/boxo/ipld/merkledag"
 	uio "github.com/ipfs/boxo/ipld/unixfs/io"
 	util "github.com/ipfs/boxo/util"
 	"github.com/ipfs/go-log/v2"
@@ -211,6 +212,7 @@ func LibP2P(bcfg *BuildCfg, cfg *config.Config, userResourceOverrides rcmgr.Part
 		fx.Provide(libp2p.ListenOn(cfg.Addresses.Swarm)),
 		fx.Invoke(libp2p.SetupDiscovery(cfg.Discovery.MDNS.Enabled)),
 		fx.Provide(libp2p.ForceReachability(cfg.Internal.Libp2pForceReachability)),
+		fx.Provide(libp2p.NonPublicAddrPublishing(cfg.Internal.NonPublicAddrPublishing)),
 		fx.Provide(libp2p.HolePunching(cfg.Swarm.EnableHolePunching, enableRelayClient)),
 
 		fx.Provide(libp2p.Security(!bcfg.DisableEncryptedConnections, cfg.Swarm.Transports)),
@@ -366,6 +368,7 @@ func Online(bcfg *BuildCfg, cfg *config.Config, userResourceOverrides rcmgr.Part
 		PeerWith(cfg.Peering.Peers...),
 
 		fx.Invoke(IpnsRepublisher(repubPeriod, recordLifetime)),
+		fx.Invoke(PurgeStaleDHTValueRecords),
 
 		fx.Provide(p2p.New),
 
@@ -451,6 +454,7 @@ func IPFS(ctx context.Context, bcfg *BuildCfg) fx.Option {
 	uio.HAMTShardingSize = int(shardSizeThreshold)
 	uio.DefaultShardWidth = int(shardMaxFanout)
 	uio.HAMTSizeEstimation = cfg.Import.HAMTSizeEstimationMode()
+	merkledag.DefaultPBNodeFieldOrder = cfg.Import.PBNodeFieldOrderMode()
 
 	providerStrategy := cfg.Provide.Strategy.WithDefault(config.DefaultProvideStrategy)
 

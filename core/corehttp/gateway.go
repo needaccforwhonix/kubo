@@ -25,6 +25,7 @@ import (
 	"github.com/ipfs/kubo/core"
 	iface "github.com/ipfs/kubo/core/coreiface"
 	"github.com/ipfs/kubo/core/node"
+	irouting "github.com/ipfs/kubo/routing"
 	"github.com/libp2p/go-libp2p/core/routing"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/attribute"
@@ -43,7 +44,11 @@ func GatewayOption(paths ...string) ServeOption {
 		}
 
 		handler := gateway.NewHandler(config, backend)
-		handler = gateway.NewHeaders(headers).ApplyCors().Wrap(handler)
+		h := gateway.NewHeaders(headers)
+		if config.DeprecatedXIpfsPath {
+			h = h.WithDeprecatedXIpfsPath()
+		}
+		handler = h.ApplyCors().Wrap(handler)
 		if fn := newServerDomainAttrFn(n); fn != nil {
 			handler = withMetricLabels(handler, fn)
 		}
@@ -73,7 +78,11 @@ func HostnameOption() ServeOption {
 
 		var handler http.Handler
 		handler = gateway.NewHostnameHandler(config, backend, childMux)
-		handler = gateway.NewHeaders(headers).ApplyCors().Wrap(handler)
+		h := gateway.NewHeaders(headers)
+		if config.DeprecatedXIpfsPath {
+			h = h.WithDeprecatedXIpfsPath()
+		}
+		handler = h.ApplyCors().Wrap(handler)
 		if fn := newServerDomainAttrFn(n); fn != nil {
 			handler = withMetricLabels(handler, fn)
 		}
@@ -166,7 +175,7 @@ func newGatewayBackend(n *core.IpfsNode) (gateway.IPFSBackend, error) {
 			namesys.WithMaxCacheTTL(cfg.Ipns.MaxCacheTTL.WithDefault(config.DefaultIpnsMaxCacheTTL)),
 		}
 
-		vsRouting = offlineroute.NewOfflineRouter(n.Repo.Datastore(), n.RecordValidator)
+		vsRouting = offlineroute.NewOfflineRouter(irouting.DHTValueDatastore(n.Repo.Datastore()), n.RecordValidator)
 		nsys, err = namesys.NewNameSystem(vsRouting, nsOptions...)
 		if err != nil {
 			return nil, fmt.Errorf("error constructing namesys: %w", err)
@@ -383,6 +392,7 @@ func getGatewayConfig(n *core.IpfsNode) (gateway.Config, map[string][]string, er
 		DeserializedResponses:   cfg.Gateway.DeserializedResponses.WithDefault(config.DefaultDeserializedResponses),
 		AllowCodecConversion:    cfg.Gateway.AllowCodecConversion.WithDefault(config.DefaultAllowCodecConversion),
 		DisableHTMLErrors:       cfg.Gateway.DisableHTMLErrors.WithDefault(config.DefaultDisableHTMLErrors),
+		DeprecatedXIpfsPath:     cfg.Gateway.DeprecatedXIpfsPath.WithDefault(config.DefaultDeprecatedXIpfsPath),
 		NoDNSLink:               cfg.Gateway.NoDNSLink,
 		PublicGateways:          map[string]*gateway.PublicGateway{},
 		RetrievalTimeout:        cfg.Gateway.RetrievalTimeout.WithDefault(config.DefaultRetrievalTimeout),

@@ -19,9 +19,11 @@
   - [`IPFS_CONTENT_BLOCKING_DISABLE`](#ipfs_content_blocking_disable)
   - [`IPFS_WAIT_REPO_LOCK`](#ipfs_wait_repo_lock)
   - [`IPFS_TELEMETRY`](#ipfs_telemetry)
+  - [`DO_NOT_TRACK`](#do_not_track)
   - [`HTTPS_PROXY`](#https_proxy)
   - [`HTTP_PROXY`](#http_proxy)
   - [`NO_PROXY`](#no_proxy)
+  - [`GOMEMLIMIT`](#gomemlimit)
   - [`LIBP2P_TCP_REUSEPORT`](#libp2p_tcp_reuseport)
   - [`LIBP2P_TCP_MUX`](#libp2p_tcp_mux)
   - [`LIBP2P_MUX_PREFS`](#libp2p_mux_prefs)
@@ -211,16 +213,26 @@ If the lock cannot be acquired because someone else has the lock, and `IPFS_WAIT
 Controls the behavior of the [telemetry plugin](telemetry.md). Valid values are:
 
 - `on`: Enables telemetry.
-- `off`: Disables telemetry.
+- `off`: Disables telemetry. Nothing is sent, and the stored anonymous identifier is removed.
 - `auto`: Like `on`, but logs an informative message about telemetry and gives user 15 minutes to opt-out before first collection. Used automatically on first run and when `IPFS_TELEMETRY` is not set.
 
-The mode can also be set in the config file under `Plugins.Plugins.telemetry.Config.Mode`.
+The mode can also be set in the config file under `Plugins.Plugins.telemetry.Config.Mode`. This variable takes precedence over both the config file and [`DO_NOT_TRACK`](#do_not_track), so `IPFS_TELEMETRY=on` keeps telemetry on for one node on a machine that opts out globally.
 
 Example:
 
 ```bash
 export IPFS_TELEMETRY="off"
 ```
+
+## `DO_NOT_TRACK`
+
+Disables the [telemetry plugin](telemetry.md). This is the shared opt-out convention read by other command line tools, so one setting covers them all. Kubo reads `1` and `true` as opting out, and ignores `0` and `false`.
+
+```bash
+export DO_NOT_TRACK=1
+```
+
+[`IPFS_TELEMETRY`](#ipfs_telemetry) overrides this variable in both directions. `DO_NOT_TRACK` overrides the `Mode` set in the config file.
 
 ## `HTTPS_PROXY`
 
@@ -265,6 +277,14 @@ Example:
 ```console
 NO_PROXY="localhost,127.0.0.1,.internal" HTTPS_PROXY=http://proxy.local:8080 ipfs daemon
 ```
+
+## `GOMEMLIMIT`
+
+Soft memory limit for the Go runtime, recognized by every Go program. As the Kubo daemon's memory use approaches this value, the garbage collector runs more often and returns free memory to the OS sooner. The limit is soft: memory that is still in use cannot be freed, so the process can exceed it under load.
+
+On devices with limited RAM, set it to about half of total memory and pair it with OS-level limits; see [Kubo on low-memory devices](production/low-memory.md) for a worked setup and the [Go garbage collector guide](https://go.dev/doc/gc-guide) for the mechanics.
+
+Default: not set (no limit)
 
 ## `LIBP2P_TCP_REUSEPORT`
 

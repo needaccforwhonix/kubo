@@ -45,9 +45,14 @@ const (
 	DAGLayoutBalanced = "balanced" // balanced DAG layout (default)
 	DAGLayoutTrickle  = "trickle"  // trickle DAG layout
 
-	DefaultUnixFSHAMTDirectorySizeEstimation = HAMTSizeEstimationLinks // legacy behavior
-	DefaultUnixFSDAGLayout                   = DAGLayoutBalanced       // balanced DAG layout
-	DefaultUnixFSIncludeEmptyDirs            = true                    // include empty directories
+	// PBNodeFieldOrder values for Import.UnixFSPBNodeFieldOrder
+	PBNodeFieldOrderLinksFirst = "links-first" // canonical DAG-PB order (default)
+	PBNodeFieldOrderDataFirst  = "data-first"  // streaming-friendly order (IPIP-550)
+
+	DefaultUnixFSHAMTDirectorySizeEstimation = HAMTSizeEstimationLinks    // legacy behavior
+	DefaultUnixFSDAGLayout                   = DAGLayoutBalanced          // balanced DAG layout
+	DefaultUnixFSIncludeEmptyDirs            = true                       // include empty directories
+	DefaultUnixFSPBNodeFieldOrder            = PBNodeFieldOrderLinksFirst // keeps existing CIDs
 )
 
 var (
@@ -69,6 +74,7 @@ type Import struct {
 	UnixFSHAMTDirectorySizeThreshold  OptionalBytes
 	UnixFSHAMTDirectorySizeEstimation OptionalString // "links", "block", or "disabled"
 	UnixFSDAGLayout                   OptionalString // "balanced" or "trickle"
+	UnixFSPBNodeFieldOrder            OptionalString // "links-first" or "data-first"
 	BatchMaxNodes                     OptionalInteger
 	BatchMaxSize                      OptionalInteger
 	FastProvideRoot                   Flag
@@ -174,6 +180,18 @@ func ValidateImportConfig(cfg *Import) error {
 		}
 	}
 
+	// Validate UnixFSPBNodeFieldOrder
+	if !cfg.UnixFSPBNodeFieldOrder.IsDefault() {
+		order := cfg.UnixFSPBNodeFieldOrder.WithDefault(DefaultUnixFSPBNodeFieldOrder)
+		switch order {
+		case PBNodeFieldOrderLinksFirst, PBNodeFieldOrderDataFirst:
+			// valid
+		default:
+			return fmt.Errorf("Import.UnixFSPBNodeFieldOrder must be %q or %q, got %q",
+				PBNodeFieldOrderLinksFirst, PBNodeFieldOrderDataFirst, order)
+		}
+	}
+
 	return nil
 }
 
@@ -241,6 +259,16 @@ func (i *Import) HAMTSizeEstimationMode() uio.SizeEstimationMode {
 	}
 }
 
+// PBNodeFieldOrderMode returns the boxo PBNodeFieldOrder based on the config value.
+func (i *Import) PBNodeFieldOrderMode() merkledag.PBNodeFieldOrder {
+	switch i.UnixFSPBNodeFieldOrder.WithDefault(DefaultUnixFSPBNodeFieldOrder) {
+	case PBNodeFieldOrderDataFirst:
+		return merkledag.PBNodeDataFirst
+	default:
+		return merkledag.PBNodeLinksFirst
+	}
+}
+
 // UnixFSSplitterFunc returns a SplitterGen function based on Import.UnixFSChunker.
 // The returned function creates a Splitter for the configured chunking strategy.
 // The chunker string is parsed once when this method is called, not on each use.
@@ -279,6 +307,11 @@ func (i *Import) MFSRootOptions() ([]mfs.Option, error) {
 		mfs.WithMaxHAMTFanout(int(i.UnixFSHAMTDirectoryMaxFanout.WithDefault(DefaultUnixFSHAMTDirectoryMaxFanout))),
 		mfs.WithHAMTShardingSize(int(i.UnixFSHAMTDirectorySizeThreshold.WithDefault(DefaultUnixFSHAMTDirectorySizeThreshold))),
 		mfs.WithSizeEstimationMode(sizeEstimationMode),
+		// Bound under-lock DAG reads so a locally-missing directory node fails
+		// after the timeout instead of blocking forever on the network and
+		// wedging MFS (ipfs/kubo#7008, #7844, #10842). Reads stay online, so
+		// lazily-referenced remote content is still fetched.
+		mfs.WithFetchTimeout(DefaultMFSFetchTimeout),
 	}, nil
 }
 

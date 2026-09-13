@@ -135,7 +135,7 @@ And then add a file at a specific URL using `ipfs urlstore add <url>`
 
 ## Private Networks
 
-It allows ipfs to only connect to other peers who have a shared secret key.
+This allows Kubo to only connect to other peers who have a shared secret key.
 
 ### State
 
@@ -150,7 +150,7 @@ Stable but not quite ready for prime-time.
 
 ### How to enable
 
-Generate a pre-shared-key using [ipfs-swarm-key-gen](https://github.com/Kubuxu/go-ipfs-swarm-key-gen)):
+Generate a pre-shared key using [ipfs-swarm-key-gen](https://github.com/Kubuxu/go-ipfs-swarm-key-gen):
 ```
 go install github.com/Kubuxu/go-ipfs-swarm-key-gen/ipfs-swarm-key-gen@latest
 ipfs-swarm-key-gen > ~/.ipfs/swarm.key
@@ -491,7 +491,11 @@ Stable, enabled by default
 
 ### State
 
-Experimental, disabled by default.
+Enabled by default since Kubo 0.39.
+
+The sweep provider has been the default since Kubo 0.39, and it turns optimistic provide on for you. So most nodes already use it. Optimistic provide speeds up the immediate announcement of a root CID when you run `ipfs add`. Scheduled reprovides do not use it; they go through the sweep provider.
+
+You only need the `Experimental.OptimisticProvide` flag if you run the legacy provider ([`Provide.DHT.SweepEnabled=false`](https://github.com/ipfs/kubo/blob/master/docs/config.md#providedhtsweepenabled)). Set it to `true` there to turn optimistic provide on.
 
 When the Amino DHT client tries to store a provider in the DHT, it typically searches for the 20 peers that are closest to the
 target key. However, this process can be time-consuming, as the search terminates only after no closer peers are found
@@ -535,17 +539,21 @@ than the classic client.
 
 For more information, see:
 
+- ProbeLab measurements and explainer: https://probelab.io/blog/optimistic-provide/
 - Project doc: https://protocollabs.notion.site/Optimistic-Provide-2c79745820fa45649d48de038516b814
 - go-libp2p-kad-dht: https://github.com/libp2p/go-libp2p-kad-dht/pull/783
 
 ### Configuring
-To enable:
+
+With the default sweep provider, optimistic provide is already enabled and there is nothing to configure. The settings below only matter when running the legacy provider (`Provide.DHT.SweepEnabled=false`).
+
+To enable optimistic provide for the legacy provider:
 
 ```
 ipfs config --json Experimental.OptimisticProvide true
 ```
 
-If you want to change the `OptimisticProvideJobsPoolSize` setting from its default of 60:
+To change the `OptimisticProvideJobsPoolSize` setting from its default of 60:
 
 ```
 ipfs config --json Experimental.OptimisticProvideJobsPoolSize 120

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -13,6 +15,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
+	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	keystore "github.com/ipfs/boxo/keystore"
 	cmds "github.com/ipfs/go-ipfs-cmds"
 	oldcmds "github.com/ipfs/kubo/commands"
@@ -23,6 +26,7 @@ import (
 	options "github.com/ipfs/kubo/core/coreiface/options"
 	fsrepo "github.com/ipfs/kubo/repo/fsrepo"
 	migrations "github.com/ipfs/kubo/repo/fsrepo/migrations"
+	"github.com/ipfs/kubo/repo/fsrepo/migrations/atomicfile"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	peer "github.com/libp2p/go-libp2p/core/peer"
 	mbase "github.com/multiformats/go-multibase"
@@ -88,7 +92,7 @@ var keyGenCmd = &cmds.Command{
 		Tagline: "Create a new keypair",
 	},
 	Options: []cmds.Option{
-		cmds.StringOption(keyStoreTypeOptionName, "t", "type of the key to create: rsa, ed25519").WithDefault(keyStoreAlgorithmDefault),
+		cmds.StringOption(keyStoreTypeOptionName, "t", "type of the key to create: rsa, ed25519, secp256k1").WithDefault(keyStoreAlgorithmDefault),
 		cmds.IntOption(keyStoreSizeOptionName, "s", "size of the key to generate"),
 		ke.OptionIPNSBase,
 	},
@@ -158,6 +162,16 @@ Exports a named libp2p key to disk.
 By default, the output will be stored at './<key-name>.key', but an alternate
 path can be specified with '--output=<path>' or '-o=<path>'.
 
+The key is written with owner-only permissions (0600). Where the path resolves
+to a regular file, or to nothing yet, the key goes to a temporary file that is
+renamed over the target: the previous contents survive a failed export, the
+parent directory has to be writable, and a target that cannot be replaced,
+such as a bind-mounted file, is reported as an error. Symlinks are followed.
+
+Where the path resolves to a character device or a pipe, such as '/dev/null',
+or '/dev/stdout' when it is a terminal or a pipe, the key is streamed to it
+unchanged. Any other target is refused.
+
 It is possible to export a private key to interoperable PEM PKCS8 format by explicitly
 passing '--format=pem-pkcs8-cleartext'. The resulting PEM file can then be consumed
 elsewhere. For example, using openssl to get a PEM with public key:
@@ -222,9 +236,14 @@ elsewhere. For example, using openssl to get a PEM with public key:
 			if ed25519KeyPointer, ok := stdKey.(*ed25519.PrivateKey); ok {
 				stdKey = *ed25519KeyPointer
 			}
-			// This function supports a restricted list of public key algorithms,
-			// but we generate and use only the RSA and ed25519 types that are on that list.
-			formattedKey, err = x509.MarshalPKCS8PrivateKey(stdKey)
+			if secpKey, ok := stdKey.(*crypto.Secp256k1PrivateKey); ok {
+				// crypto/x509 does not support the secp256k1 curve
+				formattedKey, err = marshalSecp256k1PrivateKey(secpKey)
+			} else {
+				// This function supports a restricted list of public key algorithms,
+				// but we generate and use only the RSA and ed25519 types that are on that list.
+				formattedKey, err = x509.MarshalPKCS8PrivateKey(stdKey)
+			}
 			if err != nil {
 				return fmt.Errorf("marshalling key to PKCS8 format: %w", err)
 			}
@@ -269,38 +288,150 @@ elsewhere. For example, using openssl to get a PEM with public key:
 				outPath = filepath.Clean(outPath)
 			}
 
-			// create file with owner-only permissions to protect private key material
-			file, err := os.OpenFile(outPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+			return writeExportedKey(outPath, outReader, exportFormat)
+		},
+	},
+}
+
+// exportedKeyFileMode keeps exported private key material readable by its
+// owner only.
+const exportedKeyFileMode = 0o600
+
+// inPlaceModes are the target types that cannot be replaced by rename and are
+// therefore written in place.
+const inPlaceModes = os.ModeCharDevice | os.ModeNamedPipe
+
+// maxSymlinkHops bounds how far a chain of symlinks is followed.
+const maxSymlinkHops = 8
+
+// writeExportedKey writes exported key material to outPath.
+//
+// A path that resolves to a regular file, or to nothing yet, is written to a
+// temporary file that is renamed over the target. The key is therefore never
+// exposed through the permissions of a file that already existed, and a
+// failed export leaves the previous file untouched. Replacing rather than
+// writing in place needs a writable parent directory, and fails on a target
+// that cannot be renamed over, such as a bind-mounted file. Symlinks are
+// followed and the key lands where they point.
+//
+// A path that resolves to a character device or a pipe cannot be renamed over
+// and is written in place, without permission enforcement, because the
+// operating system owns those objects. Every other target is refused.
+func writeExportedKey(outPath string, outReader io.Reader, exportFormat string) error {
+	writeKey := func(w io.Writer) error {
+		switch exportFormat {
+		case keyFormatPemCleartextOption:
+			privKeyBytes, err := io.ReadAll(outReader)
 			if err != nil {
 				return err
 			}
-			defer file.Close()
 
-			switch exportFormat {
-			case keyFormatPemCleartextOption:
-				privKeyBytes, err := io.ReadAll(outReader)
-				if err != nil {
-					return err
-				}
-
-				err = pem.Encode(file, &pem.Block{
-					Type:  "PRIVATE KEY",
-					Bytes: privKeyBytes,
-				})
-				if err != nil {
-					return fmt.Errorf("encoding PEM block: %w", err)
-				}
-
-			case keyFormatLibp2pCleartextOption:
-				_, err = io.Copy(file, outReader)
-				if err != nil {
-					return err
-				}
+			if err := pem.Encode(w, &pem.Block{
+				Type:  "PRIVATE KEY",
+				Bytes: privKeyBytes,
+			}); err != nil {
+				return fmt.Errorf("encoding PEM block: %w", err)
 			}
+		case keyFormatLibp2pCleartextOption:
+			if _, err := io.Copy(w, outReader); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unrecognized export format: %s", exportFormat)
+		}
+		return nil
+	}
 
-			return nil
-		},
-	},
+	// Stat resolves symlinks: -o /dev/stdout is a link into /proc/self/fd.
+	info, err := os.Stat(outPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err == nil {
+		if info.Mode()&inPlaceModes != 0 {
+			return writeExportedKeyInPlace(outPath, writeKey)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("refusing to export key to %s: not a regular file, character device or pipe", outPath)
+		}
+	}
+
+	// The key is written next to the target and renamed over it, so replace
+	// what a symlink points at rather than the symlink itself.
+	outPath, err = resolveSymlink(outPath)
+	if err != nil {
+		return err
+	}
+
+	file, err := atomicfile.New(outPath, exportedKeyFileMode)
+	if err != nil {
+		return fmt.Errorf("creating temporary file for %s: %w", outPath, err)
+	}
+	if err := writeKey(file); err != nil {
+		return errors.Join(err, file.Abort())
+	}
+	// Flush before the rename, so a crash cannot leave an empty file where the
+	// previous export was.
+	if err := file.Sync(); err != nil {
+		return errors.Join(fmt.Errorf("flushing %s: %w", outPath, err), file.Abort())
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("writing %s: %w", outPath, err)
+	}
+	return nil
+}
+
+// resolveSymlink returns the path a chain of symlinks ends at.
+// filepath.EvalSymlinks cannot be used on the path as a whole: it fails when
+// the last link points at a file that does not exist yet, and such a link
+// still says where the key belongs. A path that cannot be inspected is
+// returned unchanged, so that the caller's write reports the problem.
+func resolveSymlink(path string) (string, error) {
+	for range maxSymlinkHops {
+		info, err := os.Lstat(path)
+		if err != nil || info.Mode()&os.ModeSymlink == 0 {
+			return path, nil
+		}
+		target, err := os.Readlink(path)
+		if err != nil {
+			return "", err
+		}
+		if !filepath.IsAbs(target) {
+			// A relative target starts at the directory the link lives in,
+			// with that directory's own links resolved. Joining it onto the
+			// path as typed would collapse ".." through them and name a file
+			// the kernel never points at.
+			dir, err := filepath.EvalSymlinks(filepath.Dir(path))
+			if err != nil {
+				return "", err
+			}
+			target = filepath.Join(dir, target)
+		}
+		path = target
+	}
+	return "", fmt.Errorf("too many levels of symbolic links: %s", path)
+}
+
+// writeExportedKeyInPlace writes to an existing character device or pipe. The
+// target type is confirmed on the open descriptor, so a path swapped for a
+// regular file after the stat cannot receive the key.
+func writeExportedKeyInPlace(outPath string, writeKey func(io.Writer) error) (err error) {
+	// No O_TRUNC: devices and pipes ignore it, and a regular file that reached
+	// this path through a race must not be emptied.
+	file, err := os.OpenFile(outPath, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, file.Close()) }()
+
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Mode()&inPlaceModes == 0 {
+		return fmt.Errorf("refusing to export key to %s: it changed type while being opened", outPath)
+	}
+	return writeKey(file)
 }
 
 var keyImportCmd = &cmds.Command{
@@ -364,7 +495,7 @@ The PEM format allows for key generation outside of the IPFS node:
 				return fmt.Errorf("expected PRIVATE KEY type in PEM block but got: %s", pemBlock.Type)
 			}
 
-			stdKey, err := x509.ParsePKCS8PrivateKey(pemBlock.Bytes)
+			stdKey, err := parsePKCS8PrivateKey(pemBlock.Bytes)
 			if err != nil {
 				return fmt.Errorf("parsing PKCS8 format: %w", err)
 			}
@@ -400,9 +531,9 @@ The PEM format allows for key generation outside of the IPFS node:
 		allowAnyKeyType, _ := req.Options[keyAllowAnyTypeOptionName].(bool)
 		if !allowAnyKeyType {
 			switch t := sk.(type) {
-			case *crypto.RsaPrivateKey, *crypto.Ed25519PrivateKey:
+			case *crypto.RsaPrivateKey, *crypto.Ed25519PrivateKey, *crypto.Secp256k1PrivateKey:
 			default:
-				return fmt.Errorf("key type %T is not allowed to be imported, only RSA or Ed25519;"+
+				return fmt.Errorf("key type %T is not allowed to be imported, only RSA, Ed25519, or Secp256k1;"+
 					" use flag --%s if you are sure of what you're doing",
 					t, keyAllowAnyTypeOptionName)
 			}
@@ -617,7 +748,7 @@ environment variable:
 	Arguments: []cmds.Argument{},
 	Options: []cmds.Option{
 		cmds.StringOption(oldKeyOptionName, "o", "Keystore name to use for backing up your existing identity"),
-		cmds.StringOption(keyStoreTypeOptionName, "t", "type of the key to create: rsa, ed25519").WithDefault(keyStoreAlgorithmDefault),
+		cmds.StringOption(keyStoreTypeOptionName, "t", "type of the key to create: rsa, ed25519, secp256k1").WithDefault(keyStoreAlgorithmDefault),
 		cmds.IntOption(keyStoreSizeOptionName, "s", "size of the key to generate"),
 	},
 	NoRemote: true,
@@ -854,4 +985,99 @@ func DaemonNotRunning(req *cmds.Request, env cmds.Environment) error {
 	}
 
 	return nil
+}
+
+// crypto/x509 does not support the secp256k1 curve, so PKCS#8 wrapping
+// (RFC 5208) of the RFC 5915 EC key structure is done manually below.
+var (
+	oidPublicKeyECDSA      = asn1.ObjectIdentifier{1, 2, 840, 10045, 2, 1}
+	oidNamedCurveSecp256k1 = asn1.ObjectIdentifier{1, 3, 132, 0, 10}
+)
+
+type pkcs8Key struct {
+	Version    int
+	Algo       pkix.AlgorithmIdentifier
+	PrivateKey []byte
+}
+
+type ecPrivateKey struct {
+	Version       int
+	PrivateKey    []byte
+	NamedCurveOID asn1.ObjectIdentifier `asn1:"optional,explicit,tag:0"`
+	PublicKey     asn1.BitString        `asn1:"optional,explicit,tag:1"`
+}
+
+func marshalSecp256k1PrivateKey(sk *crypto.Secp256k1PrivateKey) ([]byte, error) {
+	k := (*secp256k1.PrivateKey)(sk)
+	pub := k.PubKey().SerializeUncompressed()
+	// like x509.MarshalPKCS8PrivateKey, the curve OID lives only in the
+	// outer AlgorithmIdentifier and is omitted from the inner EC key
+	ecDER, err := asn1.Marshal(ecPrivateKey{
+		Version:    1,
+		PrivateKey: k.Serialize(),
+		PublicKey:  asn1.BitString{Bytes: pub, BitLength: len(pub) * 8},
+	})
+	if err != nil {
+		return nil, err
+	}
+	params, err := asn1.Marshal(oidNamedCurveSecp256k1)
+	if err != nil {
+		return nil, err
+	}
+	return asn1.Marshal(pkcs8Key{
+		Version: 0,
+		Algo: pkix.AlgorithmIdentifier{
+			Algorithm:  oidPublicKeyECDSA,
+			Parameters: asn1.RawValue{FullBytes: params},
+		},
+		PrivateKey: ecDER,
+	})
+}
+
+// parsePKCS8PrivateKey extends x509.ParsePKCS8PrivateKey with support for
+// secp256k1 keys.
+func parsePKCS8PrivateKey(der []byte) (any, error) {
+	if isSecp256k1PKCS8(der) {
+		return parseSecp256k1PrivateKey(der)
+	}
+	return x509.ParsePKCS8PrivateKey(der)
+}
+
+func isSecp256k1PKCS8(der []byte) bool {
+	var wrapper pkcs8Key
+	if rest, err := asn1.Unmarshal(der, &wrapper); err != nil || len(rest) > 0 {
+		return false
+	}
+	if !wrapper.Algo.Algorithm.Equal(oidPublicKeyECDSA) {
+		return false
+	}
+	var curve asn1.ObjectIdentifier
+	if _, err := asn1.Unmarshal(wrapper.Algo.Parameters.FullBytes, &curve); err != nil {
+		return false
+	}
+	return curve.Equal(oidNamedCurveSecp256k1)
+}
+
+func parseSecp256k1PrivateKey(der []byte) (*secp256k1.PrivateKey, error) {
+	var wrapper pkcs8Key
+	if _, err := asn1.Unmarshal(der, &wrapper); err != nil {
+		return nil, err
+	}
+	var ec ecPrivateKey
+	if _, err := asn1.Unmarshal(wrapper.PrivateKey, &ec); err != nil {
+		return nil, fmt.Errorf("invalid EC private key: %w", err)
+	}
+	if ec.Version != 1 {
+		return nil, fmt.Errorf("unsupported EC private key version %d", ec.Version)
+	}
+	if len(ec.PrivateKey) > 32 {
+		return nil, errors.New("invalid EC private key length")
+	}
+	var buf [32]byte
+	copy(buf[32-len(ec.PrivateKey):], ec.PrivateKey)
+	var scalar secp256k1.ModNScalar
+	if overflow := scalar.SetBytes(&buf); overflow != 0 || scalar.IsZero() {
+		return nil, errors.New("EC private key not in the valid range for secp256k1")
+	}
+	return secp256k1.NewPrivateKey(&scalar), nil
 }

@@ -65,6 +65,7 @@ config file at runtime.
     - [`Gateway.NoDNSLink`](#gatewaynodnslink)
     - [`Gateway.DeserializedResponses`](#gatewaydeserializedresponses)
     - [`Gateway.AllowCodecConversion`](#gatewayallowcodecconversion)
+    - [`Gateway.DeprecatedXIpfsPath`](#gatewaydeprecatedxipfspath)
     - [`Gateway.DisableHTMLErrors`](#gatewaydisablehtmlerrors)
     - [`Gateway.ExposeRoutingAPI`](#gatewayexposeroutingapi)
     - [`Gateway.RetrievalTimeout`](#gatewayretrievaltimeout)
@@ -107,6 +108,7 @@ config file at runtime.
     - [`Internal.ShutdownTimeout`](#internalshutdowntimeout)
     - [`Internal.CGNATCheck`](#internalcgnatcheck)
     - [`Internal.DeadListenerCheck`](#internaldeadlistenercheck)
+    - [`Internal.NonPublicAddrPublishing`](#internalnonpublicaddrpublishing)
   - [`Ipns`](#ipns)
     - [`Ipns.RepublishPeriod`](#ipnsrepublishperiod)
     - [`Ipns.RecordLifetime`](#ipnsrecordlifetime)
@@ -253,6 +255,7 @@ config file at runtime.
     - [`Import.UnixFSHAMTDirectorySizeThreshold`](#importunixfshamtdirectorysizethreshold)
     - [`Import.UnixFSHAMTDirectorySizeEstimation`](#importunixfshamtdirectorysizeestimation)
     - [`Import.UnixFSDAGLayout`](#importunixfsdaglayout)
+    - [`Import.UnixFSPBNodeFieldOrder`](#importunixfspbnodefieldorder)
   - [`Version`](#version)
     - [`Version.AgentSuffix`](#versionagentsuffix)
     - [`Version.SwarmCheckEnabled`](#versionswarmcheckenabled)
@@ -773,6 +776,7 @@ When activated, together with [`AutoTLS.AutoWSS`](#autotlsautowss) (default) or 
 **Note:**
 
 - This feature requires a publicly reachable node. If behind NAT, manual port forwarding or UPnP (`Swarm.DisableNatPortMap=false`) is required.
+- On a node without a certificate yet, broker health is confirmed before the first registration attempt (HTTP GET of `/v1/health` at [`AutoTLS.RegistrationEndpoint`](#autotlsregistrationendpoint) must return HTTP 204). The check runs after [`AutoTLS.RegistrationDelay`](#autotlsregistrationdelay), once the node is publicly reachable. While the broker keeps failing the check, certificate setup is postponed and health is re-checked hourly; issuance starts automatically once the broker recovers.
 - The first time AutoTLS is used, it may take 5-15 minutes + [`AutoTLS.RegistrationDelay`](#autotlsregistrationdelay) before `/ws` listener is added. Be patient.
 - Avoid manual configuration. [`AutoTLS.AutoWSS=true`](#autotlsautowss) should automatically add `/ws` listener to existing, firewall-forwarded `/tcp` ports.
 - To troubleshoot, use `GOLOG_LOG_LEVEL="error,autotls=debug` for detailed logs, or `GOLOG_LOG_LEVEL="error,autotls=info` for quieter output.
@@ -1308,6 +1312,27 @@ Default: `false`
 
 Type: `flag`
 
+### `Gateway.DeprecatedXIpfsPath`
+
+An optional flag to restore the deprecated `X-Ipfs-Path` response header,
+superseded by
+[`Ipfs-Uri`](https://specs.ipfs.tech/http-gateways/path-gateway/#ipfs-uri-response-header)
+([IPIP-548](https://github.com/ipfs/specs/pull/548)).
+
+> [!IMPORTANT]
+> Using `X-Ipfs-Path` is not safe when non-ASCII filenames are involved: HTTP
+> headers cannot carry such bytes, so values arrive garbled. Enable this flag
+> only to facilitate migration to
+> [`Ipfs-Uri`](https://specs.ipfs.tech/http-gateways/path-gateway/#ipfs-uri-response-header),
+> which carries an [`ipfs://`](https://specs.ipfs.tech/ipfs-uri/) or
+> [`ipns://`](https://specs.ipfs.tech/ipns-uri/) address that is safe for any
+> filename. Even when enabled, the legacy header is still skipped when the
+> value would include non-ASCII byte sequences.
+
+Default: `false`
+
+Type: `flag`
+
 ### `Gateway.DisableHTMLErrors`
 
 An optional flag to disable the pretty HTML error pages of the gateway. Instead,
@@ -1634,88 +1659,40 @@ ipfs config --json Gateway.PublicGateways '{"localhost": null }'
 
 ### `Gateway` recipes
 
-Below is a list of the most common gateway setups.
-
-> [!IMPORTANT]
-> See [Reverse Proxy Caveats](gateway.md#reverse-proxy) if running behind nginx or another reverse proxy.
-
-- Public [subdomain gateway](https://docs.ipfs.tech/how-to/address-ipfs-on-web/#subdomain-gateway) at `http://{cid}.ipfs.dweb.link` (each content root gets its own Origin)
-
-   ```console
-   $ ipfs config --json Gateway.PublicGateways '{
-       "dweb.link": {
-         "UseSubdomains": true,
-         "Paths": ["/ipfs", "/ipns"]
-       }
-     }'
-   ```
-
-  - **Performance:** Consider enabling `Routing.AcceleratedDHTClient=true` to improve content routing lookups. Separately, gateway operators should decide if the gateway node should also co-host and provide (announce) fetched content to the DHT. If providing content, enable `Provide.DHT.SweepEnabled=true` for efficient announcements. If announcements are still not fast enough, adjust `Provide.DHT.MaxWorkers`. For a read-only gateway that doesn't announce content, use `Provide.Enabled=false`.
-  - **Backward-compatible:** this feature enables automatic redirects from content paths to subdomains:
-
-     `http://dweb.link/ipfs/{cid}` → `http://{cid}.ipfs.dweb.link`
-
-  - **X-Forwarded-Proto:** if you run Kubo behind a reverse proxy that provides TLS, make it add a `X-Forwarded-Proto: https` HTTP header to ensure users are redirected to `https://`, not `http://`. It will also ensure DNSLink names are inlined to fit in a single DNS label, so they work fine with a wildcard TLS cert ([details](https://github.com/ipfs/in-web-browsers/issues/169)). The NGINX directive is `proxy_set_header X-Forwarded-Proto "https";`.:
-
-     `http://dweb.link/ipfs/{cid}` → `https://{cid}.ipfs.dweb.link`
-
-     `http://dweb.link/ipns/your-dnslink.site.example.com` → `https://your--dnslink-site-example-com.ipfs.dweb.link`
-
-  - **X-Forwarded-Host:** we also support `X-Forwarded-Host: example.com` if you want to override subdomain gateway host from the original request:
-
-     `http://dweb.link/ipfs/{cid}` → `http://{cid}.ipfs.example.com`
-
-- Public [path gateway](https://docs.ipfs.tech/how-to/address-ipfs-on-web/#path-gateway) at `http://ipfs.io/ipfs/{cid}` (no Origin separation)
-
-   ```console
-   $ ipfs config --json Gateway.PublicGateways '{
-       "ipfs.io": {
-         "UseSubdomains": false,
-         "Paths": ["/ipfs", "/ipns"]
-       }
-     }'
-   ```
-
-  - **Performance:** Consider enabling `Routing.AcceleratedDHTClient=true` to improve content routing lookups. When running an open, recursive gateway, decide if the gateway should also co-host and provide (announce) fetched content to the DHT. If providing content, enable `Provide.DHT.SweepEnabled=true` for efficient announcements. If announcements are still not fast enough, adjust `Provide.DHT.MaxWorkers`. For a read-only gateway that doesn't announce content, use `Provide.Enabled=false`.
-
-- Public [DNSLink](https://dnslink.io/) gateway resolving every hostname passed in `Host` header.
-
-  ```console
-  ipfs config --json Gateway.NoDNSLink false
-  ```
-
-  - Note that `NoDNSLink: false` is the default (it works out of the box unless set to `true` manually)
-
-- Hardened, site-specific [DNSLink gateway](https://docs.ipfs.tech/how-to/address-ipfs-on-web/#dnslink-gateway).
-
-  Disable fetching of remote data (`NoFetch: true`) and resolving DNSLink at unknown hostnames (`NoDNSLink: true`).
-  Then, enable DNSLink gateway only for the specific hostname (for which data
-  is already present on the node), without exposing any content-addressing `Paths`:
-
-   ```console
-   $ ipfs config --json Gateway.NoFetch true
-   $ ipfs config --json Gateway.NoDNSLink true
-   $ ipfs config --json Gateway.PublicGateways '{
-       "en.wikipedia-on-ipfs.org": {
-         "NoDNSLink": false,
-         "Paths": []
-       }
-     }'
-   ```
+Common gateway setups are documented in the gateway guide under
+[Gateway recipes](gateway.md#gateway-recipes): the choice between serving any
+content from the network and serving only your own content (`Gateway.NoFetch`),
+plus the subdomain, path, and DNSLink URL styles.
 
 ## `Identity`
 
 ### `Identity.PeerID`
 
-The unique PKI identity label for this configs peer. Set on init and never read,
-it's merely here for convenience. Ipfs will always generate the peerID from its
-keypair at runtime.
+The peer ID that identifies this node, derived from [`Identity.PrivKey`](#identityprivkey)
+and stored in the canonical base58 form (`12D3Koo...` or `Qm...`). Kubo checks that it
+agrees with the key at startup and refuses to start if they do not.
+
+This field cannot be changed on its own. `ipfs config` accepts only the node's own PeerID,
+in any standard representation (base58 or CIDv1, see the [libp2p spec](https://github.com/libp2p/specs/blob/master/peer-ids/peer-ids.md#string-representation)),
+and rewrites it to the base58 form; `ipfs config replace` re-derives it from the key. To
+change the node's identity, use `ipfs key rotate` (see [`Identity.PrivKey`](#identityprivkey)).
 
 Type: `string` (peer ID)
 
 ### `Identity.PrivKey`
 
-The base64 encoded protobuf describing (and containing) the node's private key.
+The base64 encoded protobuf describing (and containing) the node's private key. This is
+the source of truth for the node's identity; [`Identity.PeerID`](#identitypeerid) is
+derived from it.
+
+Kubo guards this key. It is scrubbed from `ipfs config show`, cannot be read or set
+through `ipfs config`, and `ipfs config replace` preserves the existing key instead of
+taking it from the replacement file. The identity is the reserved `self` key: it lives
+here in the config (not in the keystore), and `ipfs key` will not export or import it.
+
+To change a node's identity, stop the daemon and run
+[`ipfs key rotate`](https://docs.ipfs.tech/reference/kubo/cli/#ipfs-key-rotate). It writes
+a new key and PeerID to the config and backs up the previous identity as a keystore key.
 
 Type: `string` (base64 encoded)
 
@@ -1975,6 +1952,20 @@ Default: `true`
 
 Type: `flag`
 
+### `Internal.NonPublicAddrPublishing`
+
+Controls whether the node publishes addresses that are not globally reachable: private-network ranges, carrier-grade NAT (`100.64.0.0/10`), link-local, loopback, unique local addresses, reserved IPv6 space, and special-use DNS names such as `.local`. Such addresses are useless to peers on the wider internet, and they say a little about your internal network.
+
+Set to `false` to keep them out of the peerstore self-entry and the signed peer record, so they stay out of DHT records and out of the signed record peers receive over identify. Useful when you want to pin down exactly what a node publishes, for example while reproducing a routing problem. Set it to `true` to publish them, which is what a LAN-only or test node wants.
+
+A few limits worth knowing. Addresses without an IP or DNS component, such as `/p2p-circuit`, are never filtered. The setting changes only what the node publishes, never what it listens on or dials, so [`ipfs id`](https://docs.ipfs.tech/reference/kubo/cli/#ipfs-id) and [`ipfs swarm addrs local`](https://docs.ipfs.tech/reference/kubo/cli/#ipfs-swarm-addrs-local) still report the unfiltered set. Peers reading the signed peer record see the filtered addresses; the older unsigned address list that identify also carries is untouched.
+
+When left unset, Kubo passes no option and the go-libp2p default applies.
+
+Default: unset (go-libp2p default)
+
+Type: `flag`
+
 ## `Ipns`
 
 ### `Ipns.RepublishPeriod`
@@ -2100,6 +2091,9 @@ Default: `"cache"`
 > See [fuse.md](./fuse.md) for setup instructions and platform-specific notes.
 
 FUSE mount point configuration options.
+
+> [!WARNING]
+> While `/ipns` or `/mfs` is mounted, change what they hold through the mounted filesystem only. Writing to the same MFS tree with `ipfs files` commands at the same time is not supported: each side keeps its own view of the tree, so a write made on one side can be lost when the other writes back, and a file deleted and created again with `ipfs files` still looks like the same file to programs watching it on the mount. Unmount before using `ipfs files` on a mounted tree.
 
 All mounts expose the `ipfs.cid` extended attribute on files and directories, returning the CID of the underlying DAG node:
 
@@ -3635,6 +3629,10 @@ It is possible to inspect the runtime limits via `ipfs swarm resources --help`.
 > `Swarm.ResourceMgr.MaxMemory` is the memory limit for go-libp2p networking stack alone, and not for entire Kubo or Bitswap.
 >
 > To set memory limit for the entire Kubo process, use [`GOMEMLIMIT` environment variable](http://web.archive.org/web/20240222201412/https://kupczynski.info/posts/go-container-aware/) which all Go programs recognize, and then set `Swarm.ResourceMgr.MaxMemory` to less than your custom `GOMEMLIMIT`.
+> For a worked example on constrained hardware, see [Kubo on low-memory devices](production/low-memory.md).
+
+> [!CAUTION]
+> Leave this unset unless you know what you are doing. Setting it too low cripples connectivity: the daemon keeps running and looks online, but the resource manager refuses new connections ("Protected from exceeding resource limits" in logs, inspect with `ipfs swarm resources`). See [libp2p resource management](libp2p-resource-management.md).
 
 Default: `[TOTAL_SYSTEM_MEMORY]/2`
 Type: [`optionalBytes`](#optionalbytes)
@@ -4287,6 +4285,32 @@ Default: `balanced`
 
 Type: `optionalString`
 
+### `Import.UnixFSPBNodeFieldOrder`
+
+Controls the order of the top-level `PBNode` protobuf fields written when
+creating `dag-pb` nodes.
+
+Accepted values:
+
+- `links-first` (default): canonical DAG-PB order, `Links` before `Data`.
+- `data-first`: `Data` before `Links`, so streaming readers can process
+  UnixFS metadata (for example HAMT fanout) before reading links. Changes
+  the CID of every written `dag-pb` node that has both fields.
+
+Only writes are affected; reading accepts both orders regardless of this
+setting. This is a low-level opt-in: no configuration profile enables
+`data-first`, and the `unixfs-v0-2015` and `unixfs-v1-2025` profiles set
+`links-first` explicitly. Enable `data-first` only when every consumer of
+your CIDs expects it, and note that MFS directories rewritten by
+`ipfs files` operations are re-encoded and get new CIDs. See
+[IPIP-550](https://github.com/ipfs/specs/pull/550) for details.
+
+Commands affected: `ipfs add`, `ipfs files` (MFS), `ipfs object patch`
+
+Default: `links-first`
+
+Type: `optionalString`
+
 ## `Version`
 
 Options to configure agent version announced to the swarm, and leveraging
@@ -4593,6 +4617,7 @@ Reduces daemon overhead on the system by disabling optional swarm services.
 > [!NOTE]
 > This profile is provided for legacy reasons.
 > With modern Kubo setting the above should not be necessary.
+> For running on constrained hardware, see [Kubo on low-memory devices](production/low-memory.md): it covers these settings individually, plus memory limits (systemd, `GOMEMLIMIT`) and DHT announcement sizing.
 
 ### `announce-off` profile
 
